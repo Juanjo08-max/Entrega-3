@@ -1,0 +1,134 @@
+from machine import Pin, ADC, Timer
+import time
+import sys
+import select
+
+# Configuración del ADC
+# Pin 34, atenuación a 11dB y resolución de 12 bits
+sensor = ADC(Pin(34))
+sensor.atten(ADC.ATTN_11DB)
+sensor.width(ADC.WIDTH_12BIT)
+
+# Led
+led_adquisicion = Pin(2, Pin.OUT) # LED integrado en muchos ESP32
+
+# Variables Globales y Banderas
+Fs = 50 # Frecuencia de muestreo inicial en Hz
+Ts = int(1000 / Fs) # Periodo en milisegundos
+nueva_lectura_lista = False
+valor_crudo = 0
+
+# Estado de los Filtros
+activar_promedio = False
+activar_mediana = False
+activar_exponencial = False
+
+# Variables de Filtros
+# Promedio Movil
+n_promedio = 10
+buffer_promedio = []
+
+# Mediana
+n_mediana = 5
+buffer_mediana = []
+
+# Exponencial (IIR)
+alpha = 0.1
+y_exp = None
+
+# Funciones de Filtrado
+def aplicar_promedio(valor):
+    global buffer_promedio
+    buffer_promedio.append(valor)
+    if len(buffer_promedio) > n_promedio:
+        buffer_promedio.pop(0)
+    return sum(buffer_promedio) / len(buffer_promedio)
+
+def aplicar_mediana(valor):
+    global buffer_mediana
+    buffer_mediana.append(valor)
+    if len(buffer_mediana) > n_mediana:
+        buffer_mediana.pop(0)
+     # Ordenar una copia para no alterar el orden temporal
+    temp = sorted(buffer_mediana)
+    return temp[len(temp) // 2]
+
+def aplicar_exponencial(valor):
+    global y_exp
+    if y_exp is None:
+        y_exp = valor
+    else:
+        # Suavizado = (alpha * lectura) + (1-alpha) * valor_anterior
+        y_exp = (alpha * valor) + ((1 - alpha) * y_exp)
+    return y_exp
+
+# Interrupción del Timer
+def isr_muestrear(t):
+    global valor_crudo, nueva_lectura_lista
+    valor_crudo = sensor.read()
+    nueva_lectura_lista = True
+    led_adquisicion.value(not led_adquisicion.value())
+
+# Inicializar Timer
+timer = Timer(0)
+timer.init(period=Ts, mode=Timer.PERIODIC, callback=isr_muestrear)
+
+# Funciones de Configuración Serial
+def verificar_consola():
+    global Fs, Ts, activar_promedio, activar_mediana, activar_exponencial
+    # Lectura no bloqueante del puerto serial
+    if select.select([sys.stdin], [], [], 0)[0]:
+        comando = sys.stdin.readline().strip().lower()
+        
+        if comando.startswith("fs="):
+            try:
+                Fs = int(comando.split("=")[1])
+                Ts = int(1000 / Fs)
+                timer.init(period=Ts, mode=Timer.PERIODIC, callback=isr_muestrear)
+                print(f"Frecuencia actualizada a {Fs} Hz")
+            except:
+                print("Error en formato Fs")
+        elif comando == "p":
+            activar_promedio = not activar_promedio
+            print(f"Filtro Promedio: {'ON' if activar_promedio else 'OFF'}")
+        elif comando == "m":
+            activar_mediana = not activar_mediana
+            print(f"Filtro Mediana: {'ON' if activar_mediana else 'OFF'}")
+        elif comando == "e":
+            activar_exponencial = not activar_exponencial
+            print(f"Filtro Exponencial: {'ON' if activar_exponencial else 'OFF'}")
+        else:
+            print("Comandos: 'fs=100', 'p' (toggle promedio), 'm' (toggle mediana), 'e' (toggle exponencial)")
+
+# Bucle Principal
+print("Iniciando adquisición... Comandos disponibles: fs=#, p, m, e")
+
+while True:
+    verificar_consola()
+    
+    if nueva_lectura_lista:
+        nueva_lectura_lista = False
+        senal_procesada = valor_crudo
+        
+        # Aplicación en Cascada
+        if activar_promedio:
+            senal_procesada = aplicar_promedio(senal_procesada)
+            
+        if activar_mediana:
+            # Ideal para eliminar picos atípicos (outliers)
+            senal_procesada = aplicar_mediana(senal_procesada)
+            
+        if activar_exponencial:
+            # Entre más bajo el alpha, más suavizado y respuesta más lenta
+            senal_procesada = aplicar_exponencial(senal_procesada)
+        
+        # Imprimir para Serial Plotter: "Cruda,Filtrada"
+        # Si no hay filtros, ambas gráficas se superpondrán
+        print(f"{valor_crudo},{senal_procesada}")
+        
+        # Almacenamiento en archivo .txt interno
+        try:
+            with open("datos.txt", "a") as f:
+                f.write(f"{valor_crudo},{senal_procesada}\n")
+        except Exception as err:
+            print("Error guardando datos:", err)
